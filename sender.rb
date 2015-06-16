@@ -9,10 +9,9 @@ CONFIG = YAML.load_file('./secrets/secrets.yml')
 date = Date.today-2
 
 file_date = date.strftime("%Y%m")
-csv_file_name = "#{CONFIG["package_name"]}_#{file_date}.csv"
+csv_file_name = "reviews_#{CONFIG["package_name"]}_#{file_date}.csv"
 
 system "BOTO_PATH=./secrets/.boto gsutil/gsutil cp -r gs://#{CONFIG["app_repo"]}/reviews/#{csv_file_name} ."
-
 
 class Slack
   def self.notify(message)
@@ -65,7 +64,7 @@ class Review
 
   def notify_to_slack
     if text || title
-      message = "*Rating: #{rate}* | version: #{version} | subdate: #{submitted_at}\n #{[title, text].join(" ")}\n <#{url}|Ответить в Google play>"
+      message = "*Rating: #{rate}* | version: #{version} | subdate: #{submitted_at}\n #{[title, text].join(" ")}\n <#{url}|Reply in Google play>"
       Slack.notify(message)
     end
   end
@@ -83,7 +82,7 @@ class Review
       "\n\n#{stars}",
       "Version: #{version} | #{date}",
       "#{[title, text].join(" ")}",
-      "<#{url}|Ответить в Google play>"
+      "<#{url}|Reply in Google play>"
     ].join("\n")
   end
 end
@@ -104,5 +103,4 @@ CSV.foreach(csv_file_name, encoding: 'bom|utf-16le', headers: true) do |row|
     })
   end
 end
-
 Review.send_reviews_from_date(date)
