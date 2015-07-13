@@ -22,6 +22,7 @@ import re
 import textwrap
 import xml.etree.ElementTree
 
+from apitools.base.py import encoding
 import boto
 from boto.gs.acl import ACL
 from boto.gs.acl import ALL_AUTHENTICATED_USERS
@@ -38,7 +39,6 @@ from gslib.cloud_api import ArgumentException
 from gslib.cloud_api import NotFoundException
 from gslib.cloud_api import Preconditions
 from gslib.exception import CommandException
-from gslib.third_party.storage_apitools import encoding as encoding
 from gslib.third_party.storage_apitools import storage_v1_messages as apitools_messages
 
 # In Python 2.6, ElementTree raises ExpatError instead of ParseError.
@@ -467,6 +467,12 @@ class LifecycleTranslation(object):
     """Translates lifecycle JSON to an apitools message."""
     try:
       deserialized_lifecycle = json.loads(json_txt)
+      # If lifecycle JSON is the in the following format
+      # {'lifecycle': {'rule': ... then strip out the 'lifecycle' key
+      # and reduce it to the following format
+      # {'rule': ...
+      if 'lifecycle' in deserialized_lifecycle:
+        deserialized_lifecycle = deserialized_lifecycle['lifecycle']
       lifecycle = encoding.DictToMessage(
           deserialized_lifecycle, apitools_messages.Bucket.LifecycleValue)
       return lifecycle
@@ -678,6 +684,9 @@ class AclTranslation(object):
       return Entry(type=ALL_USERS, permission=permission)
     elif entity.lower() == ALL_AUTHENTICATED_USERS.lower():
       return Entry(type=ALL_AUTHENTICATED_USERS, permission=permission)
+    elif entity.startswith('project'):
+      raise CommandException('XML API does not support project scopes, '
+                             'cannot translate ACL.')
     elif 'email' in entry_json:
       if entity.startswith('user'):
         scope_type = USER_BY_EMAIL
@@ -697,10 +706,6 @@ class AclTranslation(object):
         scope_type = GROUP_BY_DOMAIN
       return Entry(type=scope_type, domain=entry_json['domain'],
                    permission=permission)
-    elif 'project' in entry_json:
-      if entity.startswith('project'):
-        raise CommandException('XML API does not support project scopes, '
-                               'cannot translate ACL.')
     raise CommandException('Failed to translate JSON ACL to XML.')
 
   @classmethod
@@ -784,4 +789,3 @@ class AclTranslation(object):
         serializable_acl.append(encoding.MessageToDict(acl_entry))
     return json.dumps(serializable_acl, sort_keys=True,
                       indent=2, separators=(',', ': '))
-

@@ -18,15 +18,25 @@ from __future__ import absolute_import
 
 import httplib
 import json
+import logging
 import os
 import socket
 import ssl
 import time
+import traceback
+
+from apitools.base.py import credentials_lib
+from apitools.base.py import encoding
+from apitools.base.py import exceptions as apitools_exceptions
+from apitools.base.py import http_wrapper as apitools_http_wrapper
+from apitools.base.py import transfer as apitools_transfer
+from apitools.base.py.util import CalculateWaitForRetry
 
 import boto
 from boto import config
 from gcs_oauth2_boto_plugin import oauth2_helper
 import httplib2
+from oauth2client import devshell
 from oauth2client import multistore_file
 
 from gslib.cloud_api import AccessDeniedException
@@ -48,23 +58,25 @@ from gslib.exception import CommandException
 from gslib.gcs_json_media import BytesTransferredContainer
 from gslib.gcs_json_media import DownloadCallbackConnectionClassFactory
 from gslib.gcs_json_media import HttpWithDownloadStream
+from gslib.gcs_json_media import HttpWithNoRetries
 from gslib.gcs_json_media import UploadCallbackConnectionClassFactory
 from gslib.gcs_json_media import WrapDownloadHttpRequest
 from gslib.gcs_json_media import WrapUploadHttpRequest
 from gslib.no_op_credentials import NoOpCredentials
+from gslib.progress_callback import ProgressCallbackWithBackoff
 from gslib.project_id import PopulateProjectId
-from gslib.third_party.storage_apitools import credentials_lib as credentials_lib
-from gslib.third_party.storage_apitools import encoding as encoding
-from gslib.third_party.storage_apitools import exceptions as apitools_exceptions
-from gslib.third_party.storage_apitools import http_wrapper as apitools_http_wrapper
 from gslib.third_party.storage_apitools import storage_v1_client as apitools_client
 from gslib.third_party.storage_apitools import storage_v1_messages as apitools_messages
-from gslib.third_party.storage_apitools import transfer as apitools_transfer
-from gslib.third_party.storage_apitools.util import CalculateWaitForRetry
+from gslib.tracker_file import DeleteTrackerFile
+from gslib.tracker_file import GetRewriteTrackerFilePath
+from gslib.tracker_file import HashRewriteParameters
+from gslib.tracker_file import ReadRewriteTrackerFile
+from gslib.tracker_file import WriteRewriteTrackerFile
 from gslib.translation_helper import CreateBucketNotFoundException
 from gslib.translation_helper import CreateObjectNotFoundException
 from gslib.translation_helper import DEFAULT_CONTENT_TYPE
 from gslib.translation_helper import REMOVE_CORS_CONFIG
+from gslib.util import GetBotoConfigFileList
 from gslib.util import GetCertsFile
 from gslib.util import GetCredentialStoreFilename
 from gslib.util import GetGceCredentialCacheFilename
@@ -72,6 +84,7 @@ from gslib.util import GetJsonResumableChunkSize
 from gslib.util import GetMaxRetryDelay
 from gslib.util import GetNewHttp
 from gslib.util import GetNumRetries
+from gslib.util import UTF8
 
 
 # Implementation supports only 'gs' URLs, so provider is unused.
@@ -83,6 +96,7 @@ NUM_BUCKETS_PER_LIST_PAGE = 1000
 NUM_OBJECTS_PER_LIST_PAGE = 1000
 
 TRANSLATABLE_APITOOLS_EXCEPTIONS = (apitools_exceptions.HttpError,
+                                    apitools_exceptions.StreamExhausted,
                                     apitools_exceptions.TransferError,
                                     apitools_exceptions.TransferInvalidError)
 
@@ -106,7 +120,6 @@ HTTP_TRANSFER_EXCEPTIONS = (apitools_exceptions.TransferRetryError,
                             socket.timeout,
                             ssl.SSLError,
                             ValueError)
-
 
 _VALIDATE_CERTIFICATES_503_MESSAGE = (
     """Service Unavailable. If you have recently changed
@@ -222,8 +235,11 @@ class GcsJsonApi(CloudApi):
         failed_cred_type = None
         raise CommandException(
             ('You have multiple types of configured credentials (%s), which is '
-             'not supported. For more help, see "gsutil help creds".')
-            % configured_cred_types)
+             'not supported. One common way this happens is if you run gsutil '
+             'config to create credentials and later run gcloud auth, and '
+             'create a second set of credentials. Your boto config path is: '
+             '%s. For more help, see "gsutil help creds".')
+            % (configured_cred_types, GetBotoConfigFileList()))
 
       failed_cred_type = CredTypes.OAUTH2_USER_ACCOUNT
       user_creds = self._GetOauth2UserAccountCreds()
@@ -231,7 +247,9 @@ class GcsJsonApi(CloudApi):
       service_account_creds = self._GetOauth2ServiceAccountCreds()
       failed_cred_type = CredTypes.GCE
       gce_creds = self._GetGceCreds()
-      return user_creds or service_account_creds or gce_creds
+      failed_cred_type = CredTypes.DEVSHELL
+      devshell_creds = self._GetDevshellCreds()
+      return user_creds or service_account_creds or gce_creds or devshell_creds
     except:  # pylint: disable=bare-except
 
       # If we didn't actually try to authenticate because there were multiple
@@ -254,8 +272,7 @@ class GcsJsonApi(CloudApi):
       raise
 
   def _HasOauth2ServiceAccountCreds(self):
-    return (config.has_option('Credentials', 'gs_service_client_id') and
-            config.has_option('Credentials', 'gs_service_key_file'))
+    return config.has_option('Credentials', 'gs_service_key_file')
 
   def _HasOauth2UserAccountCreds(self):
     return config.has_option('Credentials', 'gs_oauth2_refresh_token')
@@ -284,8 +301,20 @@ class GcsJsonApi(CloudApi):
           return None
         raise
 
+  def _GetDevshellCreds(self):
+    try:
+      return devshell.DevshellCredentials()
+    except devshell.NoDevshellServer:
+      return None
+    except:
+      raise
+
   def _GetNewDownloadHttp(self, download_stream):
     return GetNewHttp(http_class=HttpWithDownloadStream, stream=download_stream)
+
+  def _GetNewUploadHttp(self):
+    """Returns an upload-safe Http object (by disabling httplib2 retries)."""
+    return GetNewHttp(http_class=HttpWithNoRetries)
 
   def GetBucket(self, bucket_name, provider=None, fields=None):
     """See CloudApi class for function doc strings."""
@@ -624,10 +653,12 @@ class GcsJsonApi(CloudApi):
         if retries > self.num_retries:
           raise ResumableDownloadException(
               'Transfer failed after %d retries. Final exception: %s' %
-              self.num_retries, str(e))
+              (self.num_retries, unicode(e).encode(UTF8)))
         time.sleep(CalculateWaitForRetry(retries, max_wait=GetMaxRetryDelay()))
-        self.logger.debug(
-            'Retrying download from byte %s after exception.', start_byte)
+        if self.logger.isEnabledFor(logging.DEBUG):
+          self.logger.debug(
+              'Retrying download from byte %s after exception: %s. Trace: %s',
+              start_byte, unicode(e).encode(UTF8), traceback.format_exc())
         apitools_http_wrapper.RebuildHttpConnections(
             apitools_download.bytes_http)
 
@@ -665,11 +696,12 @@ class GcsJsonApi(CloudApi):
     }
     if start_byte or end_byte:
       apitools_download.GetRange(additional_headers=additional_headers,
-                                 start=start_byte, end=end_byte)
+                                 start=start_byte, end=end_byte,
+                                 use_chunks=False)
     else:
-      apitools_download.StreamInChunks(
+      apitools_download.StreamMedia(
           callback=_NoOpCallback, finish_callback=_NoOpCallback,
-          additional_headers=additional_headers)
+          additional_headers=additional_headers, use_chunks=False)
     return apitools_download.encoding
 
   def PatchObjectMetadata(self, bucket_name, object_name, metadata,
@@ -749,7 +781,7 @@ class GcsJsonApi(CloudApi):
         bytes_uploaded_container, total_size=total_size,
         progress_callback=progress_callback)
 
-    upload_http = GetNewHttp()
+    upload_http = self._GetNewUploadHttp()
     upload_http_class = callback_class_factory.GetConnectionClass()
     upload_http.connections = {'http': upload_http_class,
                                'https': upload_http_class}
@@ -907,11 +939,13 @@ class GcsJsonApi(CloudApi):
             if retries > self.num_retries:
               raise ResumableUploadException(
                   'Transfer failed after %d retries. Final exception: %s' %
-                  (self.num_retries, e))
+                  (self.num_retries, unicode(e).encode(UTF8)))
             time.sleep(
                 CalculateWaitForRetry(retries, max_wait=GetMaxRetryDelay()))
-          self.logger.debug(
-              'Retrying upload from byte %s after exception.', start_byte)
+          if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                'Retrying upload from byte %s after exception: %s. Trace: %s',
+                start_byte, unicode(e).encode(UTF8), traceback.format_exc())
     except TRANSLATABLE_APITOOLS_EXCEPTIONS, e:
       resumable_ex = self._TranslateApitoolsResumableUploadException(e)
       if resumable_ex:
@@ -955,15 +989,15 @@ class GcsJsonApi(CloudApi):
         tracker_callback=tracker_callback, progress_callback=progress_callback,
         apitools_strategy=apitools_transfer.RESUMABLE_UPLOAD)
 
-  def CopyObject(self, src_bucket_name, src_obj_name, dst_obj_metadata,
-                 src_generation=None, canned_acl=None, preconditions=None,
-                 provider=None, fields=None):
+  def CopyObject(self, src_obj_metadata, dst_obj_metadata, src_generation=None,
+                 canned_acl=None, preconditions=None, progress_callback=None,
+                 max_bytes_per_call=None, provider=None, fields=None):
     """See CloudApi class for function doc strings."""
     ValidateDstObjectMetadata(dst_obj_metadata)
     predefined_acl = None
     if canned_acl:
       predefined_acl = (
-          apitools_messages.StorageObjectsCopyRequest.
+          apitools_messages.StorageObjectsRewriteRequest.
           DestinationPredefinedAclValueValuesEnum(
               self._ObjectCannedAclToPredefinedAcl(canned_acl)))
 
@@ -973,24 +1007,67 @@ class GcsJsonApi(CloudApi):
     if not preconditions:
       preconditions = Preconditions()
 
-    projection = (apitools_messages.StorageObjectsCopyRequest
-                  .ProjectionValueValuesEnum.full)
+    projection = (apitools_messages.StorageObjectsRewriteRequest.
+                  ProjectionValueValuesEnum.full)
     global_params = apitools_messages.StandardQueryParameters()
     if fields:
-      global_params.fields = ','.join(set(fields))
+      # Rewrite returns the resultant object under the 'resource' field.
+      new_fields = set(['done', 'objectSize', 'rewriteToken',
+                        'totalBytesRewritten'])
+      for field in fields:
+        new_fields.add('resource/' + field)
+      global_params.fields = ','.join(set(new_fields))
 
-    apitools_request = apitools_messages.StorageObjectsCopyRequest(
-        sourceBucket=src_bucket_name, sourceObject=src_obj_name,
-        destinationBucket=dst_obj_metadata.bucket,
-        destinationObject=dst_obj_metadata.name,
-        projection=projection, object=dst_obj_metadata,
-        sourceGeneration=src_generation,
-        ifGenerationMatch=preconditions.gen_match,
-        ifMetagenerationMatch=preconditions.meta_gen_match,
-        destinationPredefinedAcl=predefined_acl)
+    # Check to see if we are resuming a rewrite.
+    tracker_file_name = GetRewriteTrackerFilePath(
+        src_obj_metadata.bucket, src_obj_metadata.name, dst_obj_metadata.bucket,
+        dst_obj_metadata.name, 'JSON')
+    rewrite_params_hash = HashRewriteParameters(
+        src_obj_metadata, dst_obj_metadata, projection,
+        src_generation=src_generation, gen_match=preconditions.gen_match,
+        meta_gen_match=preconditions.meta_gen_match,
+        canned_acl=predefined_acl, fields=global_params.fields,
+        max_bytes_per_call=max_bytes_per_call)
+    resume_rewrite_token = ReadRewriteTrackerFile(tracker_file_name,
+                                                  rewrite_params_hash)
+
+    progress_cb_with_backoff = None
     try:
-      return self.api_client.objects.Copy(apitools_request,
-                                          global_params=global_params)
+      last_bytes_written = 0L
+      while True:
+        apitools_request = apitools_messages.StorageObjectsRewriteRequest(
+            sourceBucket=src_obj_metadata.bucket,
+            sourceObject=src_obj_metadata.name,
+            destinationBucket=dst_obj_metadata.bucket,
+            destinationObject=dst_obj_metadata.name,
+            projection=projection, object=dst_obj_metadata,
+            sourceGeneration=src_generation,
+            ifGenerationMatch=preconditions.gen_match,
+            ifMetagenerationMatch=preconditions.meta_gen_match,
+            destinationPredefinedAcl=predefined_acl,
+            rewriteToken=resume_rewrite_token,
+            maxBytesRewrittenPerCall=max_bytes_per_call)
+        rewrite_response = self.api_client.objects.Rewrite(
+            apitools_request, global_params=global_params)
+        bytes_written = long(rewrite_response.totalBytesRewritten)
+        if progress_callback and not progress_cb_with_backoff:
+          progress_cb_with_backoff = ProgressCallbackWithBackoff(
+              long(rewrite_response.objectSize), progress_callback)
+        if progress_cb_with_backoff:
+          progress_cb_with_backoff.Progress(
+              bytes_written - last_bytes_written)
+
+        if rewrite_response.done:
+          break
+        elif not resume_rewrite_token:
+          # Save the token and make a tracker file if they don't already exist.
+          resume_rewrite_token = rewrite_response.rewriteToken
+          WriteRewriteTrackerFile(tracker_file_name, rewrite_params_hash,
+                                  rewrite_response.rewriteToken)
+        last_bytes_written = bytes_written
+
+      DeleteTrackerFile(tracker_file_name)
+      return rewrite_response.resource
     except TRANSLATABLE_APITOOLS_EXCEPTIONS, e:
       self._TranslateExceptionAndRaise(e, bucket_name=dst_obj_metadata.bucket,
                                        object_name=dst_obj_metadata.name)
@@ -1047,8 +1124,11 @@ class GcsJsonApi(CloudApi):
       return self.api_client.objects.Compose(apitools_request,
                                              global_params=global_params)
     except TRANSLATABLE_APITOOLS_EXCEPTIONS, e:
-      self._TranslateExceptionAndRaise(e, bucket_name=dst_bucket_name,
-                                       object_name=dst_obj_name)
+      # We can't be sure which object was missing in the 404 case.
+      if isinstance(e, apitools_exceptions.HttpError) and e.status_code == 404:
+        raise NotFoundException('One of the source objects does not exist.')
+      else:
+        self._TranslateExceptionAndRaise(e)
 
   def WatchBucket(self, bucket_name, address, channel_id, token=None,
                   provider=None, fields=None):
@@ -1173,12 +1253,20 @@ class GcsJsonApi(CloudApi):
       elif e.status_code >= 500:
         return ResumableUploadException(
             message or 'Server Error', status=e.status_code)
+      elif e.status_code == 429:
+        return ResumableUploadException(
+            message or 'Too Many Requests', status=e.status_code)
       elif e.status_code == 410:
+        return ResumableUploadStartOverException(
+            message or 'Bad Request', status=e.status_code)
+      elif e.status_code == 404:
         return ResumableUploadStartOverException(
             message or 'Bad Request', status=e.status_code)
       elif e.status_code >= 400:
         return ResumableUploadAbortException(
             message or 'Bad Request', status=e.status_code)
+    if isinstance(e, apitools_exceptions.StreamExhausted):
+      return ResumableUploadAbortException(e.message)
     if (isinstance(e, apitools_exceptions.TransferError) and
         ('Aborting transfer' in e.message or
          'Not enough bytes in stream' in e.message or

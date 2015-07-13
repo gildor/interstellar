@@ -1,3 +1,118 @@
+Release 4.13 (release date: 2015-06-03)
+=======================================
+New Features
+------------
+- Added -U flag to cp and rsync commands to allow skipping of unsupported
+  object types.
+- Added support for Google Developer Shell credentials.
+
+Bug Fixes
+---------
+- Precondition headers (x-goog-if-...) are now respected for the setmeta
+  command.
+- Fixed an index out of range error that could occur with an empty
+  parallel composite upload tracker file.
+- The stat command outputs errors to stderr instead of stdout.
+- Fixed two possible sources of ResumableUploadStartOverException from
+  httplib2 and oauth2client.
+- Fixed a bug in the compose command where a missing source object resulted
+  in an error message claiming the destination object was missing.
+
+Other Changes
+-------------
+- Added a help section on throttling gsutil.
+- Resumable uploads will now start over if a PUT to the upload ID returns
+  an HTTP 404. Previously this behavior applied only to an HTTP 410.
+- XML API resumable uploads now retry on HTTP 429 errors, matching the
+  behavior of JSON API resumable uploads.
+- Improved response to process kill signals, reducing the likelihood of
+  leaving orphaned child processes and temporary files.
+- Bucket lifecycle configuration now works for S3.
+- Removed the deprecated setmeta -n option.
+
+
+Release 4.12 (release date: 2015-04-20)
+=======================================
+New Features
+------------
+- Added support for JSON-format service account private key files.
+- Added support for the Rewrite API (JSON API only). This is used for
+  all copies within the Google Cloud and supports copying objects across
+  storage classes and/or locations.
+
+Bug Fixes
+---------
+- Fixed a bug that could cause downloads to have a hash mismatch (and deletion
+  of the corrupted file) when resumed across process breaks via a tracker file.
+
+Other Changes
+-------------
+- Updated documentation and examples for several topics including
+  acl, cp, dev, signurl, stat, and wildcards.
+
+
+Release 4.11 (release date: 2015-03-10)
+=======================================
+New Features
+------------
+- Added Nearline storage class support to the mb command.
+
+Bug Fixes
+---------
+- Fixed a bug for streaming uploads that could occasionally cause a HTTP 410
+  from the service or a hash mismatch (and deletion of the corrutped file).
+- Fixed an OverflowError that occurred when uploading files > 4GiB on a 32-bit
+  operating system.
+
+Other Changes
+-------------
+- Added documentation around using the Content-MD5 header to extend integrity
+  checking to include checksums computed by a client-side content pipeline.
+
+
+Release 4.10 (release date: 2015-03-03)
+=======================================
+Bug Fixes
+---------
+- Fixed a bug that could cause undetected data corruption (preserving incorrect
+  data) if a streaming upload encountered a service error on non-8KiB-aligned
+  boundary.
+- Fixed a bug that caused downloads to be truncated if the connection broke,
+  resulting in a hash mismatch (and deletion of the corrupted file) for that
+  download.
+- Fixed a format string arguments error that occurred if a download exhausted
+  all retries.
+
+Other Changes
+-------------
+- The lifecycle command now accepts JSON input in the form of
+  "{ "lifecycle": { "rule" ..." in addition to "{ "rule": ...".
+- Improved access token expiry logic for GCE credentials.
+
+
+Release 4.9 (release date: 2015-02-13)
+=======================================
+New Features
+------------
+- When using the JSON API, the ch acl/defacl subcommand now supports
+  project groups via the -p flag. For details, see "gsutil help acl ch".
+
+Bug Fixes
+---------
+- Fixed a bug that caused daisy-chain copies (including cross-provider
+  copies) for files large than 100MiB to fail.
+- Fixed a bug that caused streaming uploads than ran for longer than
+  an hour to fail with HTTP 400s.
+- Fixed a bug where perfdiag would not properly clean up its test files.
+- Fixed a bug where using ls with the XML API could mistakenly report bucket
+  configuration as present.
+
+Other Changes
+-------------
+- Updated documentation for metadata, retries, security, and subdirs.
+- Tracker files are no longer written for small downloads.
+
+
 Release 4.8 (release date: 2015-01-23)
 =======================================
 New Features
