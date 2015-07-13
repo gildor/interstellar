@@ -4,14 +4,19 @@ require 'date'
 require 'csv'
 require 'yaml'
 
-CONFIG = YAML.load_file('./secrets/secrets.yml')
+CONFIG = YAML.load_file(ENV['INTERSTELLAR_CONFIG'])
 
 date = Date.today-2
 
 file_date = date.strftime("%Y%m")
 csv_file_name = "reviews_#{CONFIG["package_name"]}_#{file_date}.csv"
 
-system "BOTO_PATH=./secrets/.boto gsutil/gsutil cp -r gs://#{CONFIG["app_repo"]}/reviews/#{csv_file_name} ."
+output = `#{CONFIG["gsutil_variables"]} #{CONFIG["gsutil_path"]} cp -r gs://#{CONFIG["app_repo"]}/reviews/#{csv_file_name} . 2>&1`
+if output.include? "No URLs matched"
+  p "Reviews not found"
+  p output
+  Process.exit(0)
+end
 
 class Slack
   def self.notify(message)
