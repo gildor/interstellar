@@ -58,8 +58,8 @@ class Review
     @text = data[:text] ? data[:text].to_s.encode("utf-8") : nil
     @title = data[:title] ? "*#{data[:title].to_s.encode("utf-8")}*\n" : nil
 
-    @submitted_at = DateTime.parse(data[:submitted_at].encode("utf-8"))
-    @original_subitted_at = DateTime.parse(data[:original_subitted_at].encode("utf-8"))
+    @submitted_at = Time.at(data[:submitted_at].to_i).to_date
+    @original_subitted_at = Time.at(data[:original_subitted_at].to_i).to_date
 
     @rate = data[:rate].encode("utf-8").to_i
     @device = data[:device] ? data[:device].to_s.encode("utf-8") : nil
